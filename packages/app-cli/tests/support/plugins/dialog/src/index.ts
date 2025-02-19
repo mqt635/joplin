@@ -54,7 +54,8 @@ joplin.plugins.register({
 			Excepteur sint occaecat cupidatat non proident, sunt in culpa qui officia deserunt mollit anim id est laborum
 		</p>
 		`);
-		await (dialogs as any).setFitToContent(handle4, false);
+		let tmpDlg: any = dialogs; // Temporary cast to use new properties.
+		await tmpDlg.setFitToContent(handle4, false);
 		await dialogs.open(handle4);
 
 	},

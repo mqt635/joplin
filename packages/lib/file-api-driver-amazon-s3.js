@@ -5,6 +5,7 @@ const JoplinError = require('./JoplinError').default;
 const { Buffer } = require('buffer');
 const { GetObjectCommand, ListObjectsV2Command, HeadObjectCommand, PutObjectCommand, DeleteObjectCommand, DeleteObjectsCommand, CopyObjectCommand } = require('@aws-sdk/client-s3');
 const { getSignedUrl } = require('@aws-sdk/s3-request-presigner');
+const parser = require('fast-xml-parser');
 
 const S3_MAX_DELETES = 1000;
 
@@ -28,8 +29,17 @@ class FileApiDriverAmazonS3 {
 	}
 
 	hasErrorCode_(error, errorCode) {
-		if (!error || typeof error.name !== 'string') return false;
-		return error.name.indexOf(errorCode) >= 0;
+		if (!error) return false;
+
+		if (error.name) {
+			return error.name.indexOf(errorCode) >= 0;
+		} else if (error.code) {
+			return error.code.indexOf(errorCode) >= 0;
+		} else if (error.Code) {
+			return error.Code.indexOf(errorCode) >= 0;
+		} else {
+			return false;
+		}
 	}
 
 	// Because of the way AWS-SDK-v3 works for getting data from a bucket we will
@@ -44,6 +54,7 @@ class FileApiDriverAmazonS3 {
 		return signedUrl;
 	}
 
+
 	// We've now moved to aws-sdk-v3 and this note is outdated, but explains the promise structure.
 	// Need to make a custom promise, built-in promise is broken: https://github.com/aws/aws-sdk-js/issues/1436
 	// TODO: Re-factor to https://github.com/aws/aws-sdk-js-v3/tree/main/clients/client-s3#asyncawait
@@ -54,20 +65,21 @@ class FileApiDriverAmazonS3 {
 				Prefix: key,
 				Delimiter: '/',
 				ContinuationToken: cursor,
-			}), (err, response) => {
-				if (err) reject(err);
+			}), (error, response) => {
+				if (error) reject(error);
 				else resolve(response);
 			});
 		});
 	}
+
 
 	async s3HeadObject(key) {
 		return new Promise((resolve, reject) => {
 			this.api().send(new HeadObjectCommand({
 				Bucket: this.s3_bucket_,
 				Key: key,
-			}), (err, response) => {
-				if (err) reject(err);
+			}), (error, response) => {
+				if (error) reject(error);
 				else resolve(response);
 			});
 		});
@@ -79,8 +91,8 @@ class FileApiDriverAmazonS3 {
 				Bucket: this.s3_bucket_,
 				Key: key,
 				Body: body,
-			}), (err, response) => {
-				if (err) reject(err);
+			}), (error, response) => {
+				if (error) reject(error);
 				else resolve(response);
 			});
 		});
@@ -96,8 +108,8 @@ class FileApiDriverAmazonS3 {
 				Key: key,
 				Body: Buffer.from(body, 'base64'),
 				ContentLength: `${fileStat.size}`,
-			}), (err, response) => {
-				if (err) reject(err);
+			}), (error, response) => {
+				if (error) reject(error);
 				else resolve(response);
 			});
 		});
@@ -109,11 +121,10 @@ class FileApiDriverAmazonS3 {
 				Bucket: this.s3_bucket_,
 				Key: key,
 			}),
-			(err, response) => {
-				if (err) {
-					console.log(err.code);
-					console.log(err.message);
-					reject(err);
+			(error, response) => {
+				if (error) {
+					console.error(error);
+					reject(error);
 				} else { resolve(response); }
 			});
 		});
@@ -126,11 +137,10 @@ class FileApiDriverAmazonS3 {
 				Bucket: this.s3_bucket_,
 				Delete: { Objects: keys },
 			}),
-			(err, response) => {
-				if (err) {
-					console.log(err.code);
-					console.log(err.message);
-					reject(err);
+			(error, response) => {
+				if (error) {
+					console.error(error);
+					reject(error);
 				} else { resolve(response); }
 			});
 		});
@@ -165,6 +175,12 @@ class FileApiDriverAmazonS3 {
 	}
 
 	metadataToStats_(mds) {
+		// aws-sdk-js-v3 can rerturn undefined instead of an empty array when there is
+		// no metadata in some cases.
+		//
+		// Thus, we handle the !mds case.
+		if (!mds) return [];
+
 		const output = [];
 		for (let i = 0; i < mds.length; i++) {
 			output.push(this.metadataToStat_(mds[i], mds[i].Key));
@@ -202,10 +218,6 @@ class FileApiDriverAmazonS3 {
 
 		let response = await this.s3ListObjects(prefixPath);
 
-		// In aws-sdk-js-v3 if there are no contents it no longer returns
-		// an empty array. This creates an Empty array to pass onward.
-		if (response.Contents === undefined) response.Contents = [];
-
 		let output = this.metadataToStats_(response.Contents, prefixPath);
 
 		while (response.IsTruncated) {
@@ -234,21 +246,46 @@ class FileApiDriverAmazonS3 {
 
 			if (options.target === 'file') {
 				output = await shim.fetchBlob(s3Url, options);
-			}
-
-			if (responseFormat === 'text') {
+			} else if (responseFormat === 'text') {
 				response = await shim.fetch(s3Url, options);
+
 				output = await response.text();
+				// we need to make sure that errors get thrown as we are manually fetching above.
+				if (!response.ok) {
+					// eslint-disable-next-line no-throw-literal -- Old code before rule was applied
+					throw { name: response.statusText, output: output };
+				}
 			}
 
 			return output;
 		} catch (error) {
-			if (this.hasErrorCode_(error, 'NoSuchKey')) {
-				return null;
-			} else if (this.hasErrorCode_(error, 'AccessDenied')) {
-				throw new JoplinError('Do not have proper permissions to Bucket', 'rejectedByTarget');
+
+			// This means that the error was on the Desktop client side and we need to handle that.
+			// On Mobile it won't match because FetchError is a node-fetch feature.
+			// https://github.com/node-fetch/node-fetch/blob/main/docs/ERROR-HANDLING.md
+			if (error.name === 'FetchError') { throw error.message; }
+
+			let parsedOutput = '';
+
+			// If error.output is not xml the last else case should
+			// actually let us see the output of error.
+			if (error.output) {
+				parsedOutput = parser.parse(error.output);
+				if (this.hasErrorCode_(parsedOutput.Error, 'AuthorizationHeaderMalformed')) {
+					throw error.output;
+				}
+
+				if (this.hasErrorCode_(parsedOutput.Error, 'NoSuchKey')) {
+					return null;
+				} else if (this.hasErrorCode_(parsedOutput.Error, 'AccessDenied')) {
+					throw new JoplinError('Do not have proper permissions to Bucket', 'rejectedByTarget');
+				}
 			} else {
-				throw error;
+				if (error.output) {
+					throw error.output;
+				} else {
+					throw error;
+				}
 			}
 		}
 	}
@@ -310,14 +347,15 @@ class FileApiDriverAmazonS3 {
 		}
 	}
 
+
 	async move(oldPath, newPath) {
 		const req = new Promise((resolve, reject) => {
 			this.api().send(new CopyObjectCommand({
 				Bucket: this.s3_bucket_,
 				CopySource: this.makePath_(oldPath),
 				Key: newPath,
-			}),(err, response) => {
-				if (err) reject(err);
+			}), (error, response) => {
+				if (error) reject(error);
 				else resolve(response);
 			});
 		});
@@ -335,6 +373,7 @@ class FileApiDriverAmazonS3 {
 		}
 	}
 
+
 	format() {
 		throw new Error('Not supported');
 	}
@@ -345,8 +384,8 @@ class FileApiDriverAmazonS3 {
 				return this.api().send(new ListObjectsV2Command({
 					Bucket: this.s3_bucket_,
 					ContinuationToken: cursor,
-				}), (err, response) => {
-					if (err) reject(err);
+				}), (error, response) => {
+					if (error) reject(error);
 					else resolve(response);
 				});
 			});
